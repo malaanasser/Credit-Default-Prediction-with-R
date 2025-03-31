@@ -1,0 +1,430 @@
+---
+title: "Credit_Risk- Cross-Validation of Several Classifiers"
+output: html_document
+date: "2025-02-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+# Running code on multiple cores
+library(doParallel)
+cl <- makeCluster(10) # Running the code on 10 cores
+registerDoParallel(cl) # start parallel computing backend
+
+```
+
+## Intro
+
+In the following analysis, we are going to assess the performance of several classifiers, namely Logistic Regression and Decision Trees. Cross-validation will be utilised to compare the accuracy as well as the variability of accuracy for each classifier. The best classifier will be chosen according to the accuracy/ variability trade-off.
+
+
+```{r LoadModules}
+library(dplyr)
+library(rpart)
+library(ROCR)
+library(knitr)
+```
+
+We import the dataset from XXX and explore its dimensions and featuers.
+
+```{r ImportData}
+data <- read.csv('LoansDatasest.csv')
+dim(data) # dimensions of the dataset
+head(data) %>% kable() # Sample of the dataset
+```
+
+The dimensions of the dataset is `r dim(data)`
+
+## Variables Pre-Processing
+
+When running the `str(data)` command below, we can see that several numeric variables are read as character variables (e.g. customer_income and loan_amnt). We can also see that many categorical variables are not encoded as factors. In the following code, we convert each variable to the appropriate type.
+
+```{r PreProcessing}
+str(data)
+
+# Remove Customer_id from the dataset
+cols <- 2:13
+data <- data[,cols]
+
+# Convert income to numeric and impute missing values
+data$customer_income <- as.numeric(data$customer_income, na.rm = T)
+data$customer_income[is.na(data$customer_income)] <- mean(data$customer_income, na.rm = TRUE)
+summary(data$customer_income)
+
+# Convert home_ownership to factor
+data$home_ownership <- factor(data$home_ownership)
+summary(data$home_ownership)
+
+# Impute na in employment_duration with mean
+summary(data$employment_duration)
+data$employment_duration[is.na(data$employment_duration)] <- mean(data$employment_duration, na.rm = TRUE)
+
+# Convert loan_intent to factor
+data$loan_intent <- factor(data$loan_intent)
+summary(data$loan_intent)
+
+# Convert loan_grade to factor
+data$loan_grade <- factor(data$loan_grade)
+summary(data$loan_grade)
+
+# Convert income to numeric and impute missing values
+data$loan_amnt <- as.numeric(gsub("£|,", "", data$loan_amnt))
+data$loan_amnt[is.na(data$loan_amnt)] <- mean(data$loan_amnt, na.rm = TRUE)
+summary(data$loan_amnt)
+
+
+# Impute missing loan_int_rate based on the mean of each loan_intent
+data <- data %>%
+  group_by(loan_intent) %>%
+  mutate(loan_int_rate = ifelse(is.na(loan_int_rate), 
+                                mean(loan_int_rate, na.rm = TRUE), 
+                                loan_int_rate)) %>%
+  ungroup() # Ungroup the data after the operation
+summary(data$loan_int_rate)
+
+
+# Convert historical_default to factor
+data$historical_default <- factor(data$historical_default)
+summary(data$historical_default)
+
+
+# Convert Current_loan_status to factor after removing observations with no status
+data <- data[data$Current_loan_status != "", ] # remove observations with no status
+data$Current_loan_status <- factor(data$Current_loan_status)
+summary(data$Current_loan_status)
+```
+
+To ensure that all variables have been re-formatted properly, we run `str(data)` again.
+
+```{r FinalStructure}
+str(data)
+
+```
+
+## Running the classifiers with k-folds cross-validation
+
+We consider 4 different classifiers:
+
+1. Logistic regression with all features
+2. Logistic regression with features: customer_age, customer_income, employment_duration, term_years, historical_default, cred_hist_length, term_years.
+3. Classification tree with complexity parameter cp = 0.05.
+4. Classification tree with complexity parameter cp = 0.1 (less depth).
+
+We will split the data into training and validation set (80% of observations) and testing set (20% of observations).
+
+```{r preparing }
+N <- nrow(data)
+print(N)
+
+set.seed(2025)
+test_index <- sample(1:N, N*0.2)
+train_index <- setdiff(1:N, test_index)
+
+data_train <- data[train_index,]
+data_test <- data[test_index,]
+
+N_train <- nrow(data_train)
+print(N_train)
+```
+
+We establish our classifiers in the code below and also choose the features to be included with the second logistic regression.
+
+```{r  classifiersDef}
+# Defining our classifiers
+classifiers <- c('class_tree01', 'class_tree02', 'log_reg01', 'log_reg02')
+
+# Choosing the features for our second logistic regression
+class4_cols <- c(1,2,4,7,9:12)
+```
+
+We also create a function to generate a confusion matrix and and return the accuracy on each model.
+
+```{r  accFunction}
+acc_func <- function(yhat, y){
+  conf <- table(yhat, y)
+  return( sum(diag(conf))/ sum(conf))
+}
+
+```
+
+The training and validation will be implemented through K-folds cross-validation approach. We consider 5-folds cross-validation. This means that as we replicate the fitting process, 80% of the training set will be used for fitting, and 20% for validation. We will replicate the cross-validation procedure 50 times. This means that each model will be assessed based on 5-folds cross validation x 50 replications. Eventually, we will see a box plot of the resulting 250 outcomes of each classifier to assess the accuracy vs. variance.
+
+
+```{r  trainingAndCross_validation}
+
+R <- 5 # Number of replications
+K <- 5 # Number of folds
+
+out <- vector('list', R) # List of matrices storing classification accuracy
+
+for (r in 1:R){
+  
+  # Establish a results matrix for each replica. The matrix will contain the accuracy
+  # for each classifier across each fold
+  acc <- matrix(NA, K, length(classifiers))
+  colnames(acc) <- classifiers # assign classifiers' names to each columns
+  
+  tau_vec01 <- c(NULL) # Vector to store optimal values of tau for first logistic reg.
+  tau_vec02 <- c(NULL) # Vector to store optimal values of tau for second logistic reg.
+  # The optimal value is that above which the observation is classified as positive in 
+  # a logistic regression
+  
+  folds_no <- rep(1:K, ceiling(N_train/K))
+  folds_no <- sample(folds_no) # shake fold numbers (permute)
+  folds_no <- folds_no[1:N_train] # ensure we have N_train indices for folds
+  
+  for (k in 1:K){
+    train_fold_index <- which(folds_no != k)
+    val_fold_index <- which(folds_no == k)
+    
+    # Classification Trees
+    ct01 <- rpart(Current_loan_status ~ ., data = data_train, subset = train_fold_index,
+                  control = list(cp = 0.05))
+    
+    ct02 <- rpart(Current_loan_status ~ ., data = data_train, subset = train_fold_index,
+                  control = list(cp = 0.1))
+    
+    # Logistic Regression Classifiers
+    log01 <- glm(Current_loan_status ~ ., data = data_train, 
+                 subset = train_fold_index, family = 'binomial')
+    
+    log02 <- glm(Current_loan_status ~ ., data = data_train[,class4_cols], 
+                 subset = train_fold_index, family = 'binomial')
+    
+    phat_ct01 <- predict(ct01, type = 'class', newdata = data_train[val_fold_index,])
+    acc[k,1] <- acc_func(phat_ct01, data_train$Current_loan_status[val_fold_index])
+    
+    phat_ct02 <- predict(ct02, type = 'class', newdata = data_train[val_fold_index,])
+    acc[k,2] <- acc_func(phat_ct02, data_train$Current_loan_status[val_fold_index])
+    
+    
+    
+    # Get predicted probabilities for default for log regression classifier 01
+    phat_log_01 <- predict(log01, type = 'response', newdata = data_train[val_fold_index,])
+    # Find the optimal tau (split threshold) at which sensitivity + specificity is max
+    pred_obj <- prediction(phat_log_01, data_train$Current_loan_status[val_fold_index])
+    sens <- performance(pred_obj, 'sens')
+    spec <- performance(pred_obj, 'spec')
+    tau <- sens@x.values[[1]]
+    
+    sens_spec <- sens@y.values[[1]] + spec@y.values[[1]]
+    best <- which.max(sens_spec)
+
+    yhat_log_01 <- ifelse(phat_log_01 > tau[best], 1, 0)
+    # Store accuracy
+    acc[k,3] <- acc_func(yhat_log_01, data_train$Current_loan_status[val_fold_index])
+    # Store optimal tau
+    tau_vec01 <- append(tau_vec01, tau[best])
+    
+    
+    # Get predicted probabilities for default for log regression classifier 02
+    phat_log_02 <- predict(log02, type = 'response', newdata = data_train[val_fold_index,])
+    # Find the optimal tau (split threshold) at which sensitivity + specificity is max
+    pred_obj <- prediction(phat_log_02, data_train$Current_loan_status[val_fold_index])
+    sens <- performance(pred_obj, 'sens')
+    spec <- performance(pred_obj, 'spec')
+    tau <- sens@x.values[[1]]
+    
+    sens_spec <- sens@y.values[[1]] + spec@y.values[[1]]
+    best <- which.max(sens_spec)
+
+    yhat_log_02 <- ifelse(phat_log_02 > tau[best], 1, 0)
+    # Store accuracy
+    acc[k,4] <- acc_func(yhat_log_02, data_train$Current_loan_status[val_fold_index])
+    # Store optimal tau
+    tau_vec02 <- append(tau_vec02, tau[best])
+    
+  }
+  
+  # Assign the matrix "acc" to the list "out" at slot r
+  out[[r]] <- acc
+}
+```
+
+## Outcomes Analysis
+
+### Optimal Tau for Logistic Regression Classifiers
+
+For the two logistic regression classifiers, we can calculate the mean of optimal Tau for each classifier.
+```{r OptimalTau}
+cat("The accuracy for first classifier is:", mean(tau_vec01), "\n",
+    "The accuracy for second classifier is:", mean(tau_vec02), "\n")
+
+```
+
+We also need to understand the variability of Tau across different subsets of the data. Hence we create a box plot.
+
+```{r TauVariability}
+boxplot(tau_vec01, tau_vec02, 
+        names = c("Logistic Model 01", "Logistic Model 02"),
+        col = c("lightblue", "lightgreen"),
+        main = "Comparison of Optimal Tau Values",
+        ylab = "Optimal Tau")
+
+grid(col = "gray70", lty = 3, lwd = 0.8)
+
+
+# Study the variability numerically
+summary(tau_vec01)
+summary(tau_vec02)
+
+```
+
+We can see that the first logistic regression classifier (with all features) has less variability in Tau. Hence, choosing the mean or median average of Tau will be more reliable compared to doing the same for the second classifier.
+However, we need to be sure that the models in their accuracy and variability before choosing the best classifier.
+
+### Assessing Classifiers' Accuracy and Variance
+
+We can see an example of the outputed accuracy matrix for each replica
+```{r AccMatrix}
+out[[4]]
+```
+
+We can calculate the average accuracy for each classifier by:
+
+1. Calculating the average accuracy for each classifier in each slot, i.e. in each `out` matrix. This will give us the average accuracy per replica.
+2. Then calculating the average overall accuracy for each classifier.
+
+```{r AccAverage}
+avg <- t(sapply(out, colMeans))
+mean_acc <- colMeans(avg)
+names(mean_acc) <- classifiers
+
+print(mean_acc)
+```
+
+Finally, we assess the variability of each classifier visually through boxplots.
+
+```{r AccVariability}
+boxplot(avg, main = "Variability of Classifiers", 
+        xlab = 'Classifiers', ylab = "Accuracy", 
+        col = c("lightblue", "lightgreen", "lightcoral", "lightyellow"))
+
+grid(col = "gray70", lty = 3, lwd = 0.8)
+```
+
+We see that the second logistic regression classifier (4th classifier) performs notably worse compared to the first three. The third classifier (logistic regression with all features) seems to have the best average accuracy. Its variability however is higher compared to the Classification Trees. 
+Since both Classification Trees have very similar outcomes and variability we opt for the second one since it has less complexity, i.e. will be less computationally heavy and also less prone to overfitting.
+
+In conclusion, we can opt for either classifier 02 (Classification Tree with cp = 0.1) or classifier 03 (Logistic Regression with all features). Since, the improvement on accuracy in the Logistic Regression classifier is negligible, we opt for the classification tree which has less variability.
+
+## Running the Chosen Classifier on Testing Data
+
+We finally run the chosen Classification Tree classifier on our testing data.
+
+```{r Testing}
+y_hat <- predict(ct02, type = 'class', newdata = data_test)
+acc_func(y_hat, data_test$Current_loan_status)
+
+```
+
+The resutling accuracy is `r acc_func(y_hat, data_test$Current_loan_status)`.
+
+
+## Improving the classification with bagging
+
+In this section, we use the Bagging procedure (Bootstrap aggregates) to see if we can improve the performance of the logistic regression and decision tree. The key idea when using bagging is:
+
+1. Bootstrapping the training data, i.e. resampling the training data with replacement B times.
+2. Extract the predictions of the resulting B models and deciding the classification of each data point by majority voting.
+
+### Bagging procedure with Logistic Regression
+
+We start with logistic regression. We implement the bootstrapping procedure 100 times. Then we assess its accuracy on the training data.
+
+```{r Bagging_Log}
+B <- 100
+
+out <- matrix(NA, N, B)
+
+for (b in 1:B){
+  set <- sample(train_index, replace = TRUE)
+  
+  bag_log <- suppressWarnings(
+    glm(Current_loan_status ~ ., data = data, subset = set, 
+        family = 'binomial', control = list(maxit = 100))
+  )
+  
+  out[set, b] <- ifelse(fitted(bag_log) > mean(tau_vec01), 1, 0)
+  
+  pred_bagLog <- predict(bag_log, newdata = data_test, type = 'response')
+  out[test_index, b] <- ifelse(pred_bagLog > mean(tau_vec01), 1, 0)
+}
+
+
+```
+
+In the following, we see sample predictions for 10 models (in cols) over 2 observations in training data and 2 observations in testing data.
+
+```{r BaggingOutcomes}
+out[train_index[c(3,40)], 1:10]
+out[test_index[c(3,40)], 1:10]
+```
+
+
+### Assessing accuracy on testing data
+
+```{r CountingVotes}
+votes <- t(apply(out, 1, function(x){
+  table(factor(x, levels = c(0,1)))
+  }
+))
+
+probs <- votes/rowSums(votes)
+
+y_hat_bag <- colnames(probs)[max.col(probs[train_index,])]
+
+acc_func(y_hat_bag, data_train$Current_loan_status)
+```
+
+We can see that there is no major improvement in accuracy for logistic regression.
+
+### Bagging procedure with Classification Tree
+
+We use the library `adabag` to implement the bagging procedure with a classification tree.
+
+```{r RF_CT}
+library(randomForest)
+
+# Set the number of replicas for running the algorithm
+R <-50
+
+acc_train <- acc_test <- rep(NA, 100)
+
+for (r in 1:R){
+  fit_rf <- randomForest(Current_loan_status ~ ., 
+                   data = data_train, 
+                    importance = TRUE)
+  yhat_fit_rf <- predict(fit_rf, type = 'class')
+  acc_train[r] <- acc_func(yhat_fit_rf, data_train$Current_loan_status)
+  
+  yhat_fit_rf <- predict(fit_rf, newdata = data_test, type = 'class')
+  acc_test[r] <- acc_func(yhat_fit_rf, data_test$Current_loan_status)
+
+}
+
+
+acc <- data.frame(acc_train, acc_test)
+boxplot(acc$acc_train, acc$acc_test, 
+        names = c("Train", "Test"), 
+        main = "Boxplot of Accuracy for Train and Test Data", 
+        ylab = "Accuracy", 
+        col = c("lightblue", "lightgreen"))
+grid(col = "gray70", lty = 3, lwd = 0.8)
+
+
+# 
+# fit_bag <- bagging(Current_loan_status ~ ., data = data_train, 
+#                    mfinal = 4,
+#                    control=rpart.control(maxdepth=5, minsplit=20))
+# yhat_fit_bag <- predict(fit_bag, type = 'class')
+# 
+# acc_func(yhat_fit_bag, data_train$Current_loan_status)
+
+
+```
+
+
+
